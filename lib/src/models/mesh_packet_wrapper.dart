@@ -77,6 +77,49 @@ class MeshPacketWrapper {
     }
   }
 
+  /// Get the position data from this packet (if this is a position packet)
+  /// Returns a Position object decoded directly from the packet payload
+  Position? get positionData {
+    if (!isPosition || decoded == null || decoded!.payload.isEmpty) return null;
+    try {
+      return Position.fromBuffer(decoded!.payload);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Get latitude in decimal degrees from position packet
+  /// Returns null if not a position packet or position data unavailable
+  double? get latitude {
+    final pos = positionData;
+    if (pos == null || !pos.hasLatitudeI()) return null;
+    return pos.latitudeI / 1e7;
+  }
+
+  /// Get longitude in decimal degrees from position packet
+  /// Returns null if not a position packet or position data unavailable
+  double? get longitude {
+    final pos = positionData;
+    if (pos == null || !pos.hasLongitudeI()) return null;
+    return pos.longitudeI / 1e7;
+  }
+
+  /// Get altitude in meters from position packet
+  /// Returns null if not a position packet or altitude unavailable
+  int? get altitude {
+    final pos = positionData;
+    if (pos == null || !pos.hasAltitude()) return null;
+    return pos.altitude;
+  }
+
+  /// Get timestamp from position packet
+  /// Returns null if not a position packet or time unavailable
+  int? get timestamp {
+    final pos = positionData;
+    if (pos == null || !pos.hasTime()) return null;
+    return pos.time;
+  }
+
   /// Get the JSON payload as a string (if applicable)
   String? get jsonPayload {
     if (decoded == null) return null;

@@ -20,7 +20,7 @@ dependencies:
   meshtastic_flutter: ^0.0.1
 ```
 
-Complete the setup for ```permission_handler``` plugin as given [here](https://pub.dev/packages/permission_handler)
+Complete the setup for `permission_handler` plugin as given [here](https://pub.dev/packages/permission_handler)
 
 ## Permissions
 
@@ -125,6 +125,16 @@ Wrapper class for MeshPacket with convenience methods.
 - `isEncrypted` / `isDecoded` - Encryption status
 - `packetTypeDescription` - Human-readable packet type
 
+#### Position Data (from packet payload)
+
+The following properties decode position data directly from the packet payload, ensuring you get the exact position from each specific packet rather than the node's current position:
+
+- `positionData` - Decoded `Position` protobuf object from packet payload
+- `latitude` - Latitude in decimal degrees (null if not a position packet)
+- `longitude` - Longitude in decimal degrees (null if not a position packet)
+- `altitude` - Altitude in meters (null if not available)
+- `timestamp` - Timestamp from position data (null if not available)
+
 ### NodeInfoWrapper
 
 Wrapper class for NodeInfo with enhanced functionality.
@@ -172,6 +182,34 @@ await client.sendTextMessage('Private message', destinationId: 0x12345678);
 
 // Send on specific channel
 await client.sendTextMessage('Channel message', channel: 1);
+```
+
+### Position Tracking
+
+```dart
+// Listen for position packets and extract position data from each packet
+client.packetStream.listen((packet) {
+  if (packet.isPosition) {
+    // Extract position directly from packet payload
+    // This gives you the exact position from THIS packet, not the node's current position
+    if (packet.latitude != null && packet.longitude != null) {
+      print('Position from ${packet.from.toRadixString(16)}:');
+      print('  Lat: ${packet.latitude}');
+      print('  Lon: ${packet.longitude}');
+      print('  Alt: ${packet.altitude}m');
+      print('  Time: ${packet.timestamp}');
+
+      // Save to database with packet-specific position
+      savePositionToDatabase(
+        deviceId: packet.from,
+        latitude: packet.latitude!,
+        longitude: packet.longitude!,
+        altitude: packet.altitude,
+        timestamp: packet.timestamp,
+      );
+    }
+  }
+});
 ```
 
 ### Node Monitoring

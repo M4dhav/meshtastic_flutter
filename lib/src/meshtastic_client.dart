@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -9,6 +10,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../generated/mesh.pb.dart';
 import '../generated/config.pb.dart';
 import '../generated/module_config.pb.dart';
+import '../generated/admin.pb.dart';
 import '../generated/channel.pb.dart';
 import '../generated/portnums.pb.dart';
 import 'models/connection_state.dart';
@@ -64,6 +66,11 @@ class MeshtasticClient {
   Stream<MeshPacketWrapper> get packetStream => _packetController.stream;
   Stream<NodeInfoWrapper> get nodeStream => _nodeController.stream;
 
+  // Controllers
+  StreamController<ConnectionStatus> get connectionController => _connectionController;
+  StreamController<MeshPacketWrapper> get packetController => _packetController;
+  StreamController<NodeInfoWrapper> get nodeController => _nodeController;
+
   // Getters for current state
   Map<int, NodeInfoWrapper> get nodes => Map.unmodifiable(_nodes);
   MyNodeInfo? get myNodeInfo => _myNodeInfo;
@@ -102,18 +109,27 @@ class MeshtasticClient {
 
   /// Request necessary permissions for BLE
   Future<void> _requestPermissions() async {
-    final permissions = [
-      Permission.bluetooth,
-      Permission.bluetoothConnect,
-      Permission.bluetoothScan,
-      Permission.locationWhenInUse,
-    ];
-
-    for (final permission in permissions) {
-      final status = await permission.request();
-      if (!status.isGranted) {
-        throw PermissionException('Permission denied: $permission');
+    if (!kIsWeb && Platform.isAndroid) {
+      // Android 12+ (API 31+): use specific BLE permissions, not legacy Permission.bluetooth
+      final connectStatus = await Permission.bluetoothConnect.request();
+      if (!connectStatus.isGranted) {
+        throw const PermissionException('Permission denied: Permission.bluetoothConnect');
       }
+      final scanStatus = await Permission.bluetoothScan.request();
+      if (!scanStatus.isGranted) {
+        throw const PermissionException('Permission denied: Permission.bluetoothScan');
+      }
+    } else if (!kIsWeb && Platform.isIOS) {
+      // iOS: Permission.bluetooth maps to CBManagerAuthorization
+      final bluetoothStatus = await Permission.bluetooth.request();
+      if (!bluetoothStatus.isGranted) {
+        throw const PermissionException('Permission denied: Permission.bluetooth');
+      }
+    }
+
+    final locationStatus = await Permission.locationWhenInUse.request();
+    if (!locationStatus.isGranted) {
+      throw const PermissionException('Permission denied: Permission.locationWhenInUse');
     }
   }
 
@@ -229,8 +245,10 @@ class MeshtasticClient {
         'notify=${_fromNumChar!.properties.notify}',
       );
 
-      // Set MTU to 512
-      await device.requestMtu(512);
+      // Set MTU to 512 (Android only — iOS negotiates MTU automatically)
+      if (!kIsWeb && Platform.isAndroid) {
+        await device.requestMtu(512);
+      }
 
       // Enable notifications on FromNum
       await _fromNumChar!.setNotifyValue(true);
@@ -322,6 +340,32 @@ class MeshtasticClient {
     await _sendPacket(packet);
   }
 
+  /// Send raw data on a custom port (e.g., PRIVATE_APP) — not intercepted by firmware modules
+  /// Returns silently if not ready. If BLE is down, the write throws a
+  /// platform exception ("device is disconnected") which the caller handles.
+  Future<void> sendData(
+    List<int> payload, {
+    int portnum = 256, // PRIVATE_APP
+  }) async {
+    if (_toRadioChar == null) return; // Not ready — skip silently
+
+    final packetId = DateTime.now().millisecondsSinceEpoch & 0xFFFFFFFF;
+
+    final packet = MeshPacket(
+      to: 0xFFFFFFFF, // Broadcast
+      id: packetId,
+      decoded: Data(
+        portnum: PortNum.valueOf(portnum) ?? PortNum.PRIVATE_APP,
+        payload: payload,
+      ),
+      hopLimit: 3,
+      priority: MeshPacket_Priority.RELIABLE,
+    );
+
+    _logger.info('Sending custom data: ${payload.length} bytes on port $portnum');
+    await _sendPacket(packet);
+  }
+
   /// Send a position update
   Future<void> sendPosition(
     double latitude,
@@ -364,6 +408,32 @@ class MeshtasticClient {
     await _sendPacket(packet);
   }
 
+  /// Send an admin config message to the device (e.g., to disable device GPS)
+  Future<void> sendAdminConfig(Config config) async {
+    if (!isConnected) {
+      throw const ConnectionException('Not connected to a device');
+    }
+
+    final adminMessage = AdminMessage(setConfig: config);
+    final packetId = DateTime.now().millisecondsSinceEpoch & 0xFFFFFFFF;
+
+    final packet = MeshPacket(
+      from: _myNodeInfo?.myNodeNum ?? 0,
+      to: _myNodeInfo?.myNodeNum ?? 0, // Send to self (local device)
+      id: packetId,
+      decoded: Data(
+        portnum: PortNum.ADMIN_APP,
+        payload: adminMessage.writeToBuffer(),
+        wantResponse: true,
+      ),
+      hopLimit: 0, // Local only
+      priority: MeshPacket_Priority.RELIABLE,
+    );
+
+    _logger.info('Sending admin config');
+    await _sendPacket(packet);
+  }
+
   /// Send a packet to the device
   Future<void> _sendPacket(MeshPacket packet) async {
     if (_toRadioChar == null) {
@@ -382,13 +452,11 @@ class MeshtasticClient {
       'id=${packet.id}, portnum=${packet.decoded.portnum}, size=${data.length} bytes',
     );
 
-    // Check if characteristic supports write without response
-    final supportsWriteWithoutResponse =
-        _toRadioChar!.properties.writeWithoutResponse;
-
+    // Always write WITH response — write-without-response can silently drop packets.
+    // The official Python library uses response=True for all ToRadio writes.
     await _toRadioChar!.write(
       data,
-      withoutResponse: supportsWriteWithoutResponse,
+      withoutResponse: false,
     );
 
     _logger.fine('Packet sent successfully');
@@ -399,13 +467,12 @@ class MeshtasticClient {
     _logger.info('Starting configuration process');
 
     // Send wantConfigId to start configuration download
-    final wantConfig = ToRadio(wantConfigId: 0);
-    // Check if characteristic supports write without response
-    final supportsWriteWithoutResponse =
-        _toRadioChar!.properties.writeWithoutResponse;
+    // Use a non-zero random ID — firmware sends back matching configCompleteId
+    final configId = DateTime.now().millisecondsSinceEpoch & 0xFFFFFFFF;
+    final wantConfig = ToRadio(wantConfigId: configId);
     await _toRadioChar!.write(
       wantConfig.writeToBuffer(),
-      withoutResponse: supportsWriteWithoutResponse,
+      withoutResponse: false,
     );
 
     // Start reading configuration data
@@ -432,6 +499,10 @@ class MeshtasticClient {
         await Future.delayed(const Duration(milliseconds: 50));
       } catch (e) {
         _logger.warning('Error reading configuration: $e');
+        // Mark config as complete anyway — BLE is connected, services discovered,
+        // notifications enabled. Config read errors shouldn't block packet sending.
+        _configComplete = true;
+        _emitConnectionState(MeshtasticConnectionState.connected);
         break;
       }
     }

@@ -8,3 +8,6 @@ export 'generated/mesh.pb.dart';
 export 'generated/mesh.pbenum.dart';
 export 'generated/config.pb.dart';
 export 'generated/module_config.pb.dart';
+export 'generated/admin.pb.dart';
+export 'generated/config.pbenum.dart';
+export 'generated/portnums.pbenum.dart';
